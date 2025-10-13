@@ -1,0 +1,136 @@
+<mujoco model="single_side_arm">
+  <compiler angle="radian" autolimits="true" />
+
+  <option timestep="0.002" integrator="RK4" />
+
+  <default>
+    <joint damping="0.5" armature="0.1" />
+    <geom contype="1" conaffinity="1" friction="1 0.5 0.005" />
+  </default>
+
+  <asset>
+    <material name="white" rgba="0.95 0.95 0.98 1" />
+    <material name="gray" rgba="0.6 0.6 0.6 1" />
+    <material name="dark" rgba="0.25 0.25 0.28 1" />
+    <material name="blue" rgba="0.2 0.5 0.9 1" />
+    <!-- 新增：橡胶材质 -->
+    <material name="rubber" rgba="0.1 0.1 0.1 0.9" />
+  </asset>
+
+  <worldbody>
+    <!-- Base/Trunk (fixed) -->
+    <body name="trunk" pos="0 0 0">
+      <geom name="trunk_geom" size="0.175 0.1 0.25" pos="0 0 0.25" type="box" material="gray" />
+      <geom name="stub_geom" size="0.03 0.03 0.03" pos="0.215 0 0.4" type="box" material="white" />
+
+      <!-- Link 1 (rotates around Z-axis) -->
+      <body name="link1_x" pos="0.245 0 0.4">
+        <inertial pos="0.1791 0 0" mass="1.2" diaginertia="0.0131907 0.0131332 0.0006625" />
+        <joint name="joint1" type="hinge" pos="0 0 0" axis="0 0 1" range="-1.5708 1.5708"
+          damping="1.0" />
+        <geom name="link1_geom" size="0.1791 0.0275 0.03" pos="0.1791 0 0" type="box"
+          material="white" />
+
+        <!-- Link 2 (rotates around Z-axis) -->
+        <body name="link2_y" pos="0.3582 0 -0.06">
+          <inertial pos="0 0.2357 0" mass="1.5" diaginertia="0.028089745 0.028089745 0.000625" />
+          <joint name="joint2" type="hinge" pos="0 0 0" axis="0 0 1" range="-1.5708 1.5708"
+            damping="1.0" />
+          <geom name="link2_geom" size="0.025 0.2357 0.025" pos="0 0.2357 0" type="box"
+            material="white" />
+
+          <!-- Rail frame (fixed) -->
+          <geom name="rail_frame_geom" size="0.04 0.03 0.12" pos="0 0.4714 -0.1" type="box"
+            material="blue" />
+
+          <!-- Rail slider (prismatic joint) -->
+          <body name="rail_slider" pos="0 0.4714 0.025">
+            <inertial pos="0 0 0" mass="0.9" diaginertia="0.00054 0.00102 0.00102" />
+            <joint name="joint3_slide" type="slide" pos="0 0 0" axis="0 0 -1" range="-0.025 0.215"
+              damping="5.0" />
+            <geom name="slider_geom" size="0.05 0.03 0.03" type="box" material="white" />
+
+            <!-- Spindle (fixed) -->
+            <body name="spindle_link" pos="0 0.04 0">
+              <inertial pos="0 0 -0.04" mass="0.4" diaginertia="0.000253333 0.000253333 0.00008" />
+              <geom name="spindle_geom" size="0.02 0.04" pos="0 0 -0.04" type="cylinder"
+                material="dark" />
+
+              <!-- ==================== 吸盘部分（修改） ==================== -->
+              <body name="suction_cup" pos="0 0 -0.08">
+                <!-- 吸盘本体的惯性 -->
+                <inertial pos="0 0 -0.02" mass="0.1"
+                  diaginertia="0.0000358333 0.0000358333 0.000045" />
+
+                <!-- 1. 吸盘主体 - 金属外壳 -->
+                <geom name="suction_body" type="cylinder"
+                  size="0.025 0.015"
+                  pos="0 0 -0.015"
+                  rgba="0.3 0.3 0.35 1"
+                  mass="0.05"
+                  friction="1.0 0.5 0.005" />
+
+                <!-- 2. 吸盘橡胶圈 - 接触面（关键！） -->
+                <geom name="suction_rim" type="cylinder"
+                  size="0.028 0.003"
+                  pos="0 0 -0.033"
+                  material="rubber"
+                  mass="0.02"
+                  friction="4.0 1.0 0.01"
+                  condim="6"
+                  solref="0.01 1.0"
+                  solimp="0.95 0.99 0.001"
+                  priority="1" />
+
+                <!-- 3. 吸盘中心吸附点 - 用于距离检测 -->
+                <site name="suction_center"
+                  pos="0 0 -0.036"
+                  size="0.003"
+                  type="sphere"
+                  rgba="1 0 0 0.6" />
+
+                <!-- 4. 末端执行器标记 - 用于观察和控制 -->
+                <site name="ee_site"
+                  pos="0 0 -0.036"
+                  size="0.008"
+                  type="sphere"
+                  rgba="0 1 0 0.5" />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Position servos for the two revolute joints -->
+    <position name="actuator_joint1" joint="joint1" kp="100" ctrlrange="-1.5708 1.5708"
+      forcerange="-60 60" />
+    <position name="actuator_joint2" joint="joint2" kp="100" ctrlrange="-1.5708 1.5708"
+      forcerange="-60 60" />
+
+    <!-- Position servo for the prismatic joint -->
+    <position name="actuator_joint3" joint="joint3_slide" kp="500" ctrlrange="-0.025 0.215"
+      forcerange="-400 400" />
+  </actuator>
+
+  <sensor>
+    <!-- Joint position sensors -->
+    <jointpos name="joint1_pos" joint="joint1" />
+    <jointpos name="joint2_pos" joint="joint2" />
+    <jointpos name="joint3_pos" joint="joint3_slide" />
+
+    <!-- Joint velocity sensors -->
+    <jointvel name="joint1_vel" joint="joint1" />
+    <jointvel name="joint2_vel" joint="joint2" />
+    <jointvel name="joint3_vel" joint="joint3_slide" />
+
+    <!-- End effector position sensor -->
+    <framepos name="ee_pos" objtype="site" objname="ee_site" />
+
+    <!-- 新增：吸盘中心位置传感器（用于距离检测） -->
+    <framepos name="suction_center_pos" objtype="site" objname="suction_center" />
+  </sensor>
+
+</mujoco>

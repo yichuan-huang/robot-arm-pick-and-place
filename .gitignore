@@ -1,0 +1,11 @@
+.vscode
+.idea
+.history
+.pytest_cache
+.DS_Store
+*__pycache__
+logs/
+model/
+assets/*.urdf
+assets/*.xacro
+video/
