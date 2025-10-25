@@ -8,5 +8,5 @@ logs/
 model/
 assets/*.urdf
 assets/*.xacro
-video/
+videos/
 *.gif
