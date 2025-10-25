@@ -9,3 +9,4 @@ model/
 assets/*.urdf
 assets/*.xacro
 video/
+*.gif

@@ -4,6 +4,7 @@ from gymnasium.core import ObsType
 from gymnasium_robotics.envs.robot_env import MujocoRobotEnv
 from typing import Optional, Any, SupportsFloat
 
+
 # Default camera configuration for rendering the environment
 DEFAULT_CAMERA_CONFIG = {
     "distance": 2.5,
@@ -13,9 +14,79 @@ DEFAULT_CAMERA_CONFIG = {
 }
 
 
+class _TrajectoryPlanner:
+    """
+    Simple kinematic waypoint planner in task-space (EE position).
+    Phases (implicitly left/right agnostic):
+      0: move above object  (x=obj.x, y=obj.y, z=hover_z)
+      1: descend to pick    (x=obj.x, y=obj.y, z=pick_z)
+      2: lift               (x=obj.x, y=obj.y, z=hover_z)  [after suction]
+      3: move above goal    (x=goal.x, y=goal.y, z=hover_z)
+      4: descend to place   (x=goal.x, y=goal.y, z=place_z)
+      5: release & retreat  (x=goal.x, y=goal.y, z=hover_z)
+    """
+
+    def __init__(
+        self,
+        obj_pos: np.ndarray,
+        goal_pos: np.ndarray,
+        hover_z: float = 0.18,
+        pick_z: float = 0.035,
+        place_z: float = 0.035,
+        pos_tol: float = 0.01,
+    ):
+        self.hover_z = float(hover_z)
+        self.pick_z = float(pick_z)
+        self.place_z = float(place_z)
+        self.pos_tol = float(pos_tol)
+
+        self.update_anchors(obj_pos, goal_pos)
+        self.phase = 0
+        self.done = False
+
+    def update_anchors(self, obj_pos: np.ndarray, goal_pos: np.ndarray):
+        self.obj = np.asarray(obj_pos, dtype=np.float64)
+        self.goal = np.asarray(goal_pos, dtype=np.float64)
+
+        self.waypoints = [
+            np.array([self.obj[0], self.obj[1], self.hover_z], dtype=np.float64),  # 0
+            np.array([self.obj[0], self.obj[1], self.pick_z], dtype=np.float64),  # 1
+            np.array([self.obj[0], self.obj[1], self.hover_z], dtype=np.float64),  # 2
+            np.array([self.goal[0], self.goal[1], self.hover_z], dtype=np.float64),  # 3
+            np.array([self.goal[0], self.goal[1], self.place_z], dtype=np.float64),  # 4
+            np.array([self.goal[0], self.goal[1], self.hover_z], dtype=np.float64),  # 5
+        ]
+
+    def current_target(self) -> np.ndarray:
+        return self.waypoints[min(self.phase, len(self.waypoints) - 1)]
+
+    def phase_one_hot(self) -> np.ndarray:
+        oh = np.zeros(6, dtype=np.float64)
+        oh[min(self.phase, 5)] = 1.0
+        return oh
+
+    def advance_if_reached(self, ee_pos: np.ndarray, is_gripping: bool) -> None:
+        if self.done:
+            return
+        tgt = self.current_target()
+        if np.linalg.norm(ee_pos - tgt) < self.pos_tol:
+            # Special gating around suction events:
+            if self.phase == 1 and not is_gripping:
+                # Wait at pick position until suction is successful
+                return
+            if self.phase == 4 and is_gripping:
+                # Arrived at the placement point but still sucking, waiting for release
+                return
+            self.phase += 1
+            if self.phase >= 6:
+                self.done = True
+
+
 class RobotArmEnv(MujocoRobotEnv):
     """
     A custom robot arm environment for a pick-and-place task using a suction gripper.
+    Adds a task-space trajectory planner and a residual "teacher" controller
+    to ease learning when the policy only outputs delta joint commands.
     """
 
     metadata = {
@@ -34,9 +105,7 @@ class RobotArmEnv(MujocoRobotEnv):
         obj_y_offset: float = 0.3,
         max_episode_steps: int = 200,
         # Action control parameters
-        action_scale: Optional[
-            np.ndarray
-        ] = None,  # Scaling factor for each joint's action
+        action_scale: Optional[np.ndarray] = None,  # scaling for 3 joints
         # Reward weights
         w_progress: float = 2.0,
         w_distance: float = -1.0,
@@ -49,7 +118,20 @@ class RobotArmEnv(MujocoRobotEnv):
         progress_clip: float = 0.1,
         vel_ema_tau: float = 0.95,
         # Suction gripper parameters
-        suction_distance_threshold: float = 0.06,  # Activation distance threshold
+        suction_distance_threshold: float = 0.06,
+        # ---- Trajectory & residual-teacher params (NEW) ----
+        use_trajectory_teacher: bool = True,
+        traj_hover_z: float = 0.18,
+        traj_pick_z: float = 0.035,
+        traj_place_z: float = 0.035,
+        traj_pos_tol: float = 0.0125,
+        # residual IK step (per env step) using damped least squares
+        teacher_lambda: float = 0.01,  # damping in IK
+        teacher_gain: float = 0.8,  # target EE step gain (meters per step upper bound ~ action_scale)
+        # assist scheduling: alpha = assist_init * exp(-decay * t/T)
+        assist_init: float = 1.0,
+        assist_decay: float = 3.0,
+        track_reward_scale: float = 2.0,  # shaping reward weight for tracking target EE
         **kwargs,
     ):
         self.model_path = model_path
@@ -63,9 +145,7 @@ class RobotArmEnv(MujocoRobotEnv):
 
         # Action scaling factors
         if action_scale is None:
-            # Default values: [joint1_rot, joint2_rot, joint3_slide]
-            # Rotational joints: ±0.1 rad/step ≈ ±5.7 deg/step
-            # Prismatic joint: ±0.02 m/step = ±2 cm/step
+            # [joint1_rot, joint2_rot, joint3_slide]
             self.action_scale = np.array([0.1, 0.1, 0.02], dtype=np.float64)
         else:
             self.action_scale = np.array(action_scale, dtype=np.float64)
@@ -100,7 +180,7 @@ class RobotArmEnv(MujocoRobotEnv):
 
         self.distance_threshold = distance_threshold
 
-        # Object sampling range
+        # Object sampling range (Keep same-side sampling, do not distinguish between left and right arms)
         self.obj_xy_range = obj_xy_range
         self.obj_x_offset = obj_x_offset
         self.obj_y_offset = obj_y_offset
@@ -121,6 +201,19 @@ class RobotArmEnv(MujocoRobotEnv):
             dtype=np.float64,
         )
 
+        # ---- Trajectory / Teacher ----
+        self.use_trajectory_teacher = bool(use_trajectory_teacher)
+        self.traj_hover_z = float(traj_hover_z)
+        self.traj_pick_z = float(traj_pick_z)
+        self.traj_place_z = float(traj_place_z)
+        self.traj_pos_tol = float(traj_pos_tol)
+        self.teacher_lambda = float(teacher_lambda)
+        self.teacher_gain = float(teacher_gain)
+        self.assist_init = float(assist_init)
+        self.assist_decay = float(assist_decay)
+        self.track_reward_scale = float(track_reward_scale)
+        self._planner: Optional[_TrajectoryPlanner] = None
+
         super().__init__(
             n_actions=action_size,
             n_substeps=n_substeps,
@@ -138,9 +231,14 @@ class RobotArmEnv(MujocoRobotEnv):
             self.model, mujoco.mjtObj.mjOBJ_EQUALITY, "suction_weld"
         )
 
+        # Cache site id for jacobian
+        self.ee_site_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_SITE, "ee_site"
+        )
+
+    # ---------- Mujoco / base lifecycle ----------
+
     def _initialize_simulation(self) -> None:
-        """Initializes the MuJoCo simulation."""
-        # Ensure goal is initialized
         if not hasattr(self, "goal"):
             self.goal = np.array([0.6032, 0.5114, 0.025], dtype=np.float64)
 
@@ -159,11 +257,11 @@ class RobotArmEnv(MujocoRobotEnv):
         self.initial_qpos = np.copy(self.data.qpos)
 
     def _env_setup(self) -> None:
-        """Sets up the environment using initial positions from the XML."""
         self._mujoco.mj_forward(self.model, self.data)
 
+    # ---------- Core step ----------
+
     def step(self, action) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
-        """Executes one timestep in the environment."""
         if np.array(action).shape != self.action_space.shape:
             raise ValueError("Action dimension mismatch")
 
@@ -174,13 +272,39 @@ class RobotArmEnv(MujocoRobotEnv):
             self.model, self.data, "obj_site"
         ).copy()
 
-        # Store state from the previous step
         if self.current_step == 0:
             self.previous_distance = self.goal_distance(object_position, self.goal)
             self.previous_ee_position = self.get_ee_position().copy()
         else:
             self.previous_distance = self.goal_distance(object_position, self.goal)
             self.previous_ee_position = self.get_ee_position().copy()
+
+        # ---- Residual teacher blending (joint part only) ----
+        if self.use_trajectory_teacher and self._planner is not None:
+            # Update target based on current phase and states
+            self._planner.update_anchors(object_position, self.goal)
+            target_ee = self._planner.current_target()
+            ee_now = self.get_ee_position().copy()
+
+            # smooth progress of planner (phase auto-advance)
+            self._planner.advance_if_reached(ee_now, self.is_gripping)
+
+            # compute teacher joint-delta (same unit as qpos)
+            teacher_joint_delta = self._ik_step_to_target(target_ee, ee_now)
+
+            # convert to action units (divide by scale) and clip
+            teacher_action = np.zeros_like(action)
+            if teacher_joint_delta is not None:
+                teacher_action[:3] = np.clip(
+                    teacher_joint_delta / self.action_scale, -1.0, 1.0
+                )
+
+            # schedule alpha
+            t = self.current_step / max(1, self.max_episode_steps)
+            alpha = self.assist_init * np.exp(-self.assist_decay * t)
+            # residual blend
+            action = action.copy()
+            action[:3] = (1.0 - alpha) * action[:3] + alpha * teacher_action[:3]
 
         # Apply action and step simulation
         self._set_action(action)
@@ -190,7 +314,6 @@ class RobotArmEnv(MujocoRobotEnv):
         if self.render_mode == "human":
             self.render()
 
-        # 🔥 Update step count *before* getting the new observation
         self.current_step += 1
 
         # Get new observation
@@ -202,7 +325,6 @@ class RobotArmEnv(MujocoRobotEnv):
             self.get_ee_position() - obs["achieved_goal"]
         )
 
-        # Build info dictionary
         info = {
             "is_success": self._is_success(obs["achieved_goal"], self.goal),
             "steps": self.current_step,
@@ -212,24 +334,22 @@ class RobotArmEnv(MujocoRobotEnv):
             "object_height": obs["achieved_goal"][2],
         }
 
-        # 🔥 Determine termination conditions
         terminated = bool(info["is_success"])
         truncated = self.current_step >= self.max_episode_steps
 
-        # Calculate reward
         reward = self.compute_reward(
             obs["achieved_goal"], self.goal, info, action=action, obs_dict=obs
         )
 
-        # Add bonus for successful termination
         if terminated and self.terminal_bonus != 0.0:
             reward = float(reward) + float(self.terminal_bonus)
 
-        # Cache action and goal for the next step
         self.prev_action = action.copy()
         self.prev_achieved_goal = obs["achieved_goal"].copy()
 
         return obs, reward, terminated, truncated, info
+
+    # ---------- Reward with trajectory shaping ----------
 
     def compute_reward(
         self,
@@ -239,54 +359,49 @@ class RobotArmEnv(MujocoRobotEnv):
         action: Optional[np.ndarray] = None,
         obs_dict: Optional[dict] = None,
     ) -> SupportsFloat:
-        """Computes the reward for the current step."""
         d = float(self.goal_distance(achieved_goal, desired_goal))
         reward_components: dict[str, float] = {}
 
-        # 1) Distance penalty: penalize distance to goal
+        # 1) Distance penalty to final goal (object to goal)
         reward_components["distance"] = self.w_distance * d
 
-        # 2) Progress reward: reward for moving closer to the goal
+        # 2) Progress shaping (Incremental progress towards the goal)
         progress_raw = 0.0
         if self.prev_achieved_goal is not None:
             prev_distance = float(
                 self.goal_distance(self.prev_achieved_goal, desired_goal)
             )
             progress_raw = float(prev_distance - d)
-            # Clip progress to prevent large reward fluctuations
             if progress_raw > 0:
                 progress_raw = min(progress_raw, self.progress_clip * 2)
             else:
                 progress_raw = max(progress_raw, -self.progress_clip)
         reward_components["progress"] = self.w_progress * progress_raw
 
-        # 3) Height reward: encourage lifting the object
+        # 3) Height reward: Lifting reward (greater after gripping)
         height_diff = float(achieved_goal[2] - self.initial_object_height)
         if height_diff > 0:
-            # Give a larger reward for lifting while gripping
             height_bonus = height_diff * (2.0 if self.is_gripping else 1.0)
             reward_components["height"] = self.w_height * height_bonus
         else:
             reward_components["height"] = 0.0
 
-        # 4) Smoothness penalty: penalize jerky movements
+        # 4) Smoothness penalty
         smooth_penalty = 0.0
         if obs_dict is not None:
             observation = obs_dict["observation"]
             ee_vel_dt = observation[3:6]
             ee_velocity = ee_vel_dt / max(self.dt, 1e-8)
-            # Use an exponential moving average to smooth the velocity
             self.vel_ema = (
                 self.vel_ema_tau * self.vel_ema + (1.0 - self.vel_ema_tau) * ee_velocity
             )
             smooth_penalty = float(np.linalg.norm(self.vel_ema))
         reward_components["smooth"] = self.w_smooth * smooth_penalty
 
-        # 5) Action penalties: encourage smaller and more consistent actions
+        # 5) Action penalties
         if action is not None:
             action_norm = float(np.linalg.norm(action))
             reward_components["action"] = self.w_action * action_norm
-            # Penalty for change in action to encourage continuity
             if self.prev_action is not None:
                 action_diff = float(np.linalg.norm(action - self.prev_action))
                 reward_components["action_change"] = self.w_action_change * action_diff
@@ -296,21 +411,36 @@ class RobotArmEnv(MujocoRobotEnv):
             reward_components["action"] = 0.0
             reward_components["action_change"] = 0.0
 
-        # 6) Success reward: large bonus for reaching the goal
+        # 6) Success reward
         reward_components["success"] = (
             self.success_reward if d < self.distance_threshold else 0.0
         )
 
-        # 7) Gripping bonus: small reward for maintaining a grip
+        # 7) Gripping bonus
         reward_components["gripping_bonus"] = 1.0 if self.is_gripping else 0.0
 
-        # Calculate total reward
+        # 8) Trajectory tracking shaping（NEW）
+        if self.use_trajectory_teacher and self._planner is not None:
+            ee_pos = self.get_ee_position()
+            tgt = self._planner.current_target()
+            track_err = float(np.linalg.norm(ee_pos - tgt))
+            # encourage going to target (upper bounded)
+            track_term = -min(track_err, 0.15)
+            # small phase completion bonuses
+            phase_bonus = 0.2 * float(self._planner.phase)
+            reward_components["track"] = (
+                self.track_reward_scale * track_term + phase_bonus
+            )
+        else:
+            reward_components["track"] = 0.0
+
         total_reward = float(sum(reward_components.values()))
         info["reward_components"] = reward_components
         return total_reward
 
+    # ---------- Actions & gripper ----------
+
     def _set_action(self, action: np.ndarray) -> None:
-        """Applies the given action to the simulation (position control)."""
         action = action.copy()
 
         # 1. Control arm joints
@@ -318,21 +448,16 @@ class RobotArmEnv(MujocoRobotEnv):
         current_joints_list = []
         for name in self.joint_names:
             qpos = self._utils.get_joint_qpos(self.model, self.data, name)
-            # Ensure qpos is a scalar float
             current_joints_list.append(
                 float(qpos.flat[0]) if isinstance(qpos, np.ndarray) else float(qpos)
             )
         current_joints = np.array(current_joints_list, dtype=np.float64)
 
-        # Calculate target position: current + (action * scale)
+        # target joints = current + delta (scaled)
         target_joints = current_joints + arm_action * self.action_scale
-
-        # Clip target to joint limits
         target_joints = np.clip(
             target_joints, self.ctrl_range[:, 0], self.ctrl_range[:, 1]
         )
-
-        # Send position command to actuators
         self.data.ctrl[:3] = target_joints
 
         # 2. Control suction gripper
@@ -340,38 +465,32 @@ class RobotArmEnv(MujocoRobotEnv):
         self._set_gripper_action(gripper_action)
 
     def _set_gripper_action(self, gripper_action: float) -> None:
-        """Controls the suction gripper based on the action value."""
-        if gripper_action > 0:  # Command: Activate
+        if gripper_action > 0:  # Activate
             if not self.is_gripping:
-                # If not gripping, try to activate suction
                 if self.try_activate_suction():
                     self.is_gripping = True
             else:
-                # If already gripping, ensure the weld is active
                 self.data.eq_active[self.suction_weld_id] = 1
-        else:  # Command: Deactivate
+        else:  # Deactivate
             if self.is_gripping:
                 self.deactivate_suction()
                 self.is_gripping = False
 
     def try_activate_suction(self) -> bool:
-        """Attempts to activate suction and returns True if successful."""
         ee_pos = self.get_ee_position()
         obj_pos = self._utils.get_site_xpos(self.model, self.data, "obj_site")
         distance = np.linalg.norm(ee_pos - obj_pos)
-
         if distance < self.suction_distance_threshold:
             self.data.eq_active[self.suction_weld_id] = 1
             return True
         return False
 
     def deactivate_suction(self) -> None:
-        """Deactivates the suction gripper."""
         self.data.eq_active[self.suction_weld_id] = 0
 
+    # ---------- Observations ----------
+
     def _get_obs(self) -> dict:
-        """Returns the current observation from the environment."""
-        # Defensive check to ensure goal is initialized
         if not hasattr(self, "goal") or self.goal.size == 0:
             self.goal = np.array([0.6032, 0.5114, 0.025], dtype=np.float64)
 
@@ -395,7 +514,6 @@ class RobotArmEnv(MujocoRobotEnv):
         joint_positions_list = []
         for name in self.joint_names:
             qpos = self._utils.get_joint_qpos(self.model, self.data, name)
-            # Ensure value is a scalar float
             if isinstance(qpos, np.ndarray):
                 val = float(qpos) if qpos.ndim == 0 else float(qpos.flat[0])
                 joint_positions_list.append(val)
@@ -415,19 +533,30 @@ class RobotArmEnv(MujocoRobotEnv):
         # Gripper state
         gripper_state = float(self.is_gripping)
 
+        # Trajectory target & phase (NEW)
+        if self.use_trajectory_teacher and self._planner is not None:
+            target = self._planner.current_target()
+            ee_to_target = target - ee_position
+            phase_oh = self._planner.phase_one_hot()
+        else:
+            ee_to_target = np.zeros(3, dtype=np.float64)
+            phase_oh = np.zeros(6, dtype=np.float64)
+
         observation = np.concatenate(
             [
-                ee_position,  # 3 - End-effector position
-                ee_velocity,  # 3 - End-effector velocity
-                joint_positions,  # 3 - Joint positions
-                object_position,  # 3 - Object position
-                object_velp,  # 3 - Object velocity
-                goal_rel_pos,  # 3 - Goal position relative to object
-                object_rel_ee,  # 3 - Object position relative to EE
-                [ee_object_distance],  # 1 - EE-to-object distance
-                [object_goal_distance],  # 1 - Object-to-goal distance
-                [normalized_time],  # 1 - Normalized time
-                [gripper_state],  # 1 - Gripper state (0 or 1)
+                ee_position,  # 3
+                ee_velocity,  # 3
+                joint_positions,  # 3
+                object_position,  # 3
+                object_velp,  # 3
+                goal_rel_pos,  # 3
+                object_rel_ee,  # 3
+                [ee_object_distance],  # 1
+                [object_goal_distance],  # 1
+                [normalized_time],  # 1
+                [gripper_state],  # 1
+                ee_to_target,  # 3  (NEW)
+                phase_oh,  # 6  (NEW)
             ]
         )
 
@@ -437,18 +566,18 @@ class RobotArmEnv(MujocoRobotEnv):
             "desired_goal": self.goal.copy(),
         }
 
+    # ---------- Success ----------
+
     def _is_success(self, achieved_goal, desired_goal) -> np.float32:
-        """Determines if the task has been successfully completed."""
         d = self.goal_distance(achieved_goal, desired_goal)
         return (d < self.distance_threshold).astype(np.float32)
 
     def _render_callback(self) -> None:
-        """Optional callback for rendering."""
         pass
 
+    # ---------- Reset ----------
+
     def _reset_sim(self) -> bool:
-        """Resets the simulation to an initial state."""
-        # Reset time and velocities
         self.data.time = self.initial_time
         self.data.qvel[:] = np.copy(self.initial_qvel)
         self.data.qpos[:] = np.copy(self.initial_qpos)
@@ -456,10 +585,8 @@ class RobotArmEnv(MujocoRobotEnv):
         if self.model.na != 0:
             self.data.act[:] = None
 
-        # Randomize object position
         self._sample_object()
 
-        # Reset episode-specific states
         self.current_step = 0
         self.previous_ee_position = None
         self.previous_distance = None
@@ -472,42 +599,85 @@ class RobotArmEnv(MujocoRobotEnv):
         self.data.eq_active[self.suction_weld_id] = 0
 
         self._mujoco.mj_forward(self.model, self.data)
+
+        if self.use_trajectory_teacher:
+            obj = self._utils.get_site_xpos(self.model, self.data, "obj_site").copy()
+            self._planner = _TrajectoryPlanner(
+                obj_pos=obj,
+                goal_pos=self.goal,
+                hover_z=self.traj_hover_z,
+                pick_z=self.traj_pick_z,
+                place_z=self.traj_place_z,
+                pos_tol=self.traj_pos_tol,
+            )
+        else:
+            self._planner = None
+
         return True
 
+    # ---------- Physics ----------
+
     def _mujoco_step(self) -> None:
-        """Advances the MuJoCo simulation."""
         for _ in range(10):
             self._mujoco.mj_step(self.model, self.data, nstep=self.n_substeps)
 
+    # ---------- Utilities ----------
+
     def goal_distance(self, goal_a, goal_b) -> SupportsFloat:
-        """Calculates the Euclidean distance between two goals."""
         assert goal_a.shape == goal_b.shape
         return np.linalg.norm(goal_a - goal_b, axis=-1)
 
     def _sample_object(self) -> None:
-        """Randomly samples a new position for the object within a safe range."""
-        # Custom range: in front of the arm, on the same side
-        # x: 0.28-0.55 (not too close, not too far)
-        # y: 0.25-0.55 (same side as the arm base)
-        # z: 0.025 (table height)
+        # same-side sampling for left-arm setup (no explicit left/right flag)
         custom_range_low = np.array([0.28, 0.25, 0.025])
         custom_range_high = np.array([0.55, 0.55, 0.025])
-
         object_position = self.np_random.uniform(custom_range_low, custom_range_high)
-
-        # Set object position (quaternion [w, x, y, z] = [1, 0, 0, 0] for no rotation)
         object_xpos = np.concatenate([object_position, np.array([1, 0, 0, 0])])
         self._utils.set_joint_qpos(self.model, self.data, "obj_joint", object_xpos)
 
     def _sample_goal(self) -> np.ndarray:
-        """Returns the fixed goal position."""
         return self.goal.copy()
 
     def get_ee_position(self) -> np.ndarray:
-        """Gets the current position of the end-effector."""
         return self._utils.get_site_xpos(self.model, self.data, "ee_site")
 
-    # Kept for backward compatibility
     def activate_suction(self) -> None:
-        """Simplified method to activate suction."""
         self.try_activate_suction()
+
+    # ---------- IK helper for residual teacher ----------
+
+    def _ik_step_to_target(
+        self, target_ee: np.ndarray, ee_now: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        One damped least-squares IK step to move EE towards target_ee.
+        Returns delta_q (in joint units) for [joint1, joint2, joint3_slide].
+        """
+        try:
+            # pose error (position only)
+            dx = np.asarray(target_ee - ee_now, dtype=np.float64)
+            # limit the instantaneous target step to avoid instability
+            if np.linalg.norm(dx) > self.teacher_gain:
+                dx = dx * (self.teacher_gain / (np.linalg.norm(dx) + 1e-8))
+
+            # get site jacobian: 3x nq for translation
+            jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+            jacr = np.zeros((3, self.model.nv), dtype=np.float64)
+            mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.ee_site_id)
+
+            # take columns corresponding to our joints' dofs (assume contiguous first 3 nv map to joint1,2,3_slide)
+            # If your model maps differently, adjust indices accordingly.
+            J = jacp[:, :3]  # shape (3,3)
+
+            # damped least squares: dq = J^T (J J^T + λ^2 I)^-1 dx
+            JJt = J @ J.T
+            lam2I = (self.teacher_lambda**2) * np.eye(3)
+            inv = np.linalg.inv(JJt + lam2I)
+            dq = J.T @ (inv @ dx)
+
+            # clip to joint control range per step
+            # (not strictly necessary here; _set_action will clip final qpos)
+            return np.asarray(dq, dtype=np.float64)
+        except Exception:
+            # fall back: no teacher step
+            return None

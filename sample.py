@@ -14,4 +14,4 @@ try:
             observation, info = env.reset()
 
 finally:
-    env.close()  # 确保环境被正确关闭
+    env.close()  # Ensure the environment is closed correctly
