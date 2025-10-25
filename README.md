@@ -32,27 +32,6 @@ cd robot-arm-pick-and-place
 pip install -r requirements.txt
 ```
 
-## Project Structure
-
-```
-robot-arm-pick-and-place/
-├── assets/                     # Model asset files
-│   ├── pick_and_place.xml     # MuJoCo scene configuration
-│   ├── single_side_arm.urdf   # Robot arm URDF model
-│   └── single_side_arm.xml    # MuJoCo robot model
-├── env/                        # Custom environments
-│   ├── __init__.py            # Environment registration
-│   ├── robot_arm_env.py       # Base robot environment class
-│   └── pick_and_place.py      # Pick-and-place task environment
-├── logs/                       # Training logs (TensorBoard)
-├── model/                      # Saved models (generated after training)
-├── videos/                     # Test videos (generated after running)
-├── SAC_train.py               # SAC training script
-├── SAC_play.py                # Model testing and video recording
-├── sample.py                  # Environment testing example
-└── requirements.txt           # Project dependencies
-```
-
 ## Usage
 
 ### 1. Test Environment
