@@ -46,9 +46,9 @@
 
         <!-- Object to pick (sphere on ground, z=0.025 to account for sphere radius) -->
         <body name="obj" pos="0.5 0.2 0.025">
-            <joint type="free" damping="0.01" name="obj_joint" />
-            <geom name="obj_geom" mass="0.05" type="sphere" size="0.025" rgba="0.2 0.8 0.3 1"
-                friction="1 0.5 0.005" condim="6" />
+            <joint type="free" damping="0.5" name="obj_joint" />
+            <geom name="obj_geom" mass="0.08" type="sphere" size="0.025" rgba="0.2 0.8 0.3 1"
+                friction="2.0 0.8 0.01" condim="6" solref="0.01 1.0" solimp="0.95 0.99 0.001" />
             <site name="obj_site" pos="0 0 0" size="0.015" type="sphere" rgba="1 1 0 0.5" />
         </body>
 

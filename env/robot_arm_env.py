@@ -107,14 +107,14 @@ class RobotArmEnv(MujocoRobotEnv):
         # Action control parameters
         action_scale: Optional[np.ndarray] = None,  # scaling for 3 joints
         # Reward weights
-        w_progress: float = 2.0,
-        w_distance: float = -1.0,
-        w_action: float = -0.001,
-        w_action_change: float = -0.005,
-        w_smooth: float = -0.002,
+        w_progress: float = 3.0,
+        w_distance: float = -0.5,
+        w_action: float = -0.0005,
+        w_action_change: float = -0.0015,
+        w_smooth: float = -0.001,
         w_height: float = 0.5,
-        success_reward: float = 10.0,
-        terminal_bonus: float = 20.0,
+        success_reward: float = 30.0,
+        terminal_bonus: float = 40.0,
         progress_clip: float = 0.1,
         vel_ema_tau: float = 0.95,
         # Suction gripper parameters
@@ -131,7 +131,7 @@ class RobotArmEnv(MujocoRobotEnv):
         # assist scheduling: alpha = assist_init * exp(-decay * t/T)
         assist_init: float = 1.0,
         assist_decay: float = 3.0,
-        track_reward_scale: float = 2.0,  # shaping reward weight for tracking target EE
+        track_reward_scale: float = 1.5,  # shaping reward weight for tracking target EE
         **kwargs,
     ):
         self.model_path = model_path
@@ -146,7 +146,8 @@ class RobotArmEnv(MujocoRobotEnv):
         # Action scaling factors
         if action_scale is None:
             # [joint1_rot, joint2_rot, joint3_slide]
-            self.action_scale = np.array([0.1, 0.1, 0.02], dtype=np.float64)
+            # 增大 joint1 的动作幅度，鼓励更多使用
+            self.action_scale = np.array([0.15, 0.12, 0.025], dtype=np.float64)
         else:
             self.action_scale = np.array(action_scale, dtype=np.float64)
 
@@ -159,6 +160,7 @@ class RobotArmEnv(MujocoRobotEnv):
         # Gripper state
         self.is_gripping = False
         self.suction_distance_threshold = suction_distance_threshold
+        self.grip_stabilization_steps = 0  # 吸附稳定计数器
 
         # Reward weights
         self.w_progress = float(w_progress)
@@ -388,17 +390,21 @@ class RobotArmEnv(MujocoRobotEnv):
 
         # 4) Smoothness penalty
         smooth_penalty = 0.0
+        ee_position = None
+        ee_object_distance = None
         if obs_dict is not None:
             observation = obs_dict["observation"]
+            ee_position = observation[:3]
             ee_vel_dt = observation[3:6]
             ee_velocity = ee_vel_dt / max(self.dt, 1e-8)
             self.vel_ema = (
                 self.vel_ema_tau * self.vel_ema + (1.0 - self.vel_ema_tau) * ee_velocity
             )
             smooth_penalty = float(np.linalg.norm(self.vel_ema))
+            ee_object_distance = float(observation[21])
         reward_components["smooth"] = self.w_smooth * smooth_penalty
 
-        # 5) Action penalties
+        # 5) Action penalties - 减少对不同关节的惩罚差异
         if action is not None:
             action_norm = float(np.linalg.norm(action))
             reward_components["action"] = self.w_action * action_norm
@@ -411,22 +417,54 @@ class RobotArmEnv(MujocoRobotEnv):
             reward_components["action"] = 0.0
             reward_components["action_change"] = 0.0
 
-        # 6) Success reward
-        reward_components["success"] = (
-            self.success_reward if d < self.distance_threshold else 0.0
-        )
+        # 6) Success reward - 只有完整完成任务才给予
+        is_success = d < self.distance_threshold and achieved_goal[2] < 0.04
+        reward_components["success"] = self.success_reward if is_success else 0.0
 
-        # 7) Gripping bonus
-        reward_components["gripping_bonus"] = 1.0 if self.is_gripping else 0.0
+        # 7) Gripping bonus - 分阶段奖励
+        if self.is_gripping:
+            if height_diff > 0.05:
+                reward_components["gripping_bonus"] = 2.0
+            else:
+                reward_components["gripping_bonus"] = 1.0
+        else:
+            reward_components["gripping_bonus"] = 0.0
 
-        # 8) Trajectory tracking shaping（NEW）
+        # 7b) Encourage initiating and finishing suction actions
+        if ee_object_distance is None:
+            ee_position = self.get_ee_position() if ee_position is None else ee_position
+            ee_object_distance = float(np.linalg.norm(ee_position - achieved_goal))
+        if not self.is_gripping and ee_object_distance < 0.03:
+            reward_components["pre_grip_bonus"] = 1.5
+        else:
+            reward_components["pre_grip_bonus"] = 0.0
+        if self.is_gripping and d < self.distance_threshold * 3 and achieved_goal[2] > 0.04:
+            reward_components["carry_bonus"] = 1.0
+        else:
+            reward_components["carry_bonus"] = 0.0
+        if (
+            not self.is_gripping
+            and d < self.distance_threshold * 1.2
+            and achieved_goal[2] < 0.045
+        ):
+            reward_components["release_bonus"] = 2.0
+        else:
+            reward_components["release_bonus"] = 0.0
+
+        # 8) Placement reward - 如果物体在目标区域上方，鼓励放下
+        if d < self.distance_threshold * 2 and achieved_goal[2] > 0.04:
+            reward_components["placement_incentive"] = 1.5
+        else:
+            reward_components["placement_incentive"] = 0.0
+
+        # 9) Trajectory tracking shaping（NEW）
         if self.use_trajectory_teacher and self._planner is not None:
-            ee_pos = self.get_ee_position()
+            if ee_position is None:
+                ee_position = self.get_ee_position()
             tgt = self._planner.current_target()
-            track_err = float(np.linalg.norm(ee_pos - tgt))
-            # encourage going to target (upper bounded)
-            track_term = -min(track_err, 0.15)
-            # small phase completion bonuses
+            track_err = float(np.linalg.norm(ee_position - tgt))
+            target_window = 0.15
+            track_term = max(target_window - track_err, 0.0)
             phase_bonus = 0.2 * float(self._planner.phase)
             reward_components["track"] = (
                 self.track_reward_scale * track_term + phase_bonus
@@ -469,20 +507,31 @@ class RobotArmEnv(MujocoRobotEnv):
             if not self.is_gripping:
                 if self.try_activate_suction():
                     self.is_gripping = True
+                    self.grip_stabilization_steps = 0
             else:
+                # 保持吸附状态
                 self.data.eq_active[self.suction_weld_id] = 1
+                self.grip_stabilization_steps += 1
         else:  # Deactivate
             if self.is_gripping:
-                self.deactivate_suction()
-                self.is_gripping = False
+                # 只有在稳定吸附一段时间后才允许释放
+                if self.grip_stabilization_steps > 3:
+                    self.deactivate_suction()
+                    self.is_gripping = False
+                    self.grip_stabilization_steps = 0
 
     def try_activate_suction(self) -> bool:
         ee_pos = self.get_ee_position()
         obj_pos = self._utils.get_site_xpos(self.model, self.data, "obj_site")
         distance = np.linalg.norm(ee_pos - obj_pos)
+
+        # 增加更严格的接触条件
         if distance < self.suction_distance_threshold:
-            self.data.eq_active[self.suction_weld_id] = 1
-            return True
+            # 检查物体速度是否较低（更稳定的抓取）
+            obj_vel = self._utils.get_site_xvelp(self.model, self.data, "obj_site")
+            if np.linalg.norm(obj_vel) < 0.5:  # 速度阈值
+                self.data.eq_active[self.suction_weld_id] = 1
+                return True
         return False
 
     def deactivate_suction(self) -> None:
@@ -570,7 +619,11 @@ class RobotArmEnv(MujocoRobotEnv):
 
     def _is_success(self, achieved_goal, desired_goal) -> np.float32:
         d = self.goal_distance(achieved_goal, desired_goal)
-        return (d < self.distance_threshold).astype(np.float32)
+        # 只有在物体在目标位置且已经释放吸盘的情况下才算成功
+        # 或者物体在目标位置且高度较低（已放下）
+        object_at_goal = d < self.distance_threshold
+        object_on_ground = achieved_goal[2] < 0.04  # 物体接近地面
+        return (object_at_goal and object_on_ground).astype(np.float32)
 
     def _render_callback(self) -> None:
         pass
@@ -596,6 +649,7 @@ class RobotArmEnv(MujocoRobotEnv):
 
         # Reset gripper
         self.is_gripping = False
+        self.grip_stabilization_steps = 0
         self.data.eq_active[self.suction_weld_id] = 0
 
         self._mujoco.mj_forward(self.model, self.data)
@@ -629,8 +683,9 @@ class RobotArmEnv(MujocoRobotEnv):
 
     def _sample_object(self) -> None:
         # same-side sampling for left-arm setup (no explicit left/right flag)
-        custom_range_low = np.array([0.28, 0.25, 0.025])
-        custom_range_high = np.array([0.55, 0.55, 0.025])
+        # 扩大采样范围，鼓励使用 joint1
+        custom_range_low = np.array([0.25, 0.15, 0.025])
+        custom_range_high = np.array([0.6, 0.6, 0.025])
         object_position = self.np_random.uniform(custom_range_low, custom_range_high)
         object_xpos = np.concatenate([object_position, np.array([1, 0, 0, 0])])
         self._utils.set_joint_qpos(self.model, self.data, "obj_joint", object_xpos)
