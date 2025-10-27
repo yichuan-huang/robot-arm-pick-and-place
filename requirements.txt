@@ -4,3 +4,4 @@ gymnasium-robotics
 stable-baselines3[extra]
 tensorboard
 tqdm
+imageio
