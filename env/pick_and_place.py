@@ -26,7 +26,7 @@ class RobotArmPickAndPlaceEnv(RobotArmEnv):
             teacher_lambda=0.01,
             teacher_gain=0.1,  # 增加引导力度
             assist_init=1.0,
-            assist_decay=2.3,  # 减慢衰减速度，让teacher辅助更持久
+            assist_decay=1.5,  # 减慢衰减速度，让teacher辅助更持久
             track_reward_scale=2.0,  # 增加轨迹跟踪奖励
             suction_distance_threshold=0.05,  # 调整吸盘阈值
             **kwargs,

@@ -68,15 +68,26 @@ class _TrajectoryPlanner:
     def advance_if_reached(self, ee_pos: np.ndarray, is_gripping: bool) -> None:
         if self.done:
             return
+
         tgt = self.current_target()
         if np.linalg.norm(ee_pos - tgt) < self.pos_tol:
             # Special gating around suction events:
             if self.phase == 1 and not is_gripping:
                 # Wait at pick position until suction is successful
                 return
-            if self.phase == 4 and is_gripping:
-                # Arrived at the placement point but still sucking, waiting for release
-                return
+
+            # ---- 修改部分：允许在 phase=4 等待有限步后继续 ----
+            if self.phase == 4:
+                if not hasattr(self, "release_wait_counter"):
+                    self.release_wait_counter = 0
+                if is_gripping:
+                    self.release_wait_counter += 1
+                    # 等待几步给 agent 松手机会（约0.1秒左右）
+                    if self.release_wait_counter < 10:
+                        return
+                # 重置计数器
+                self.release_wait_counter = 0
+
             self.phase += 1
             if self.phase >= 6:
                 self.done = True
@@ -103,6 +114,11 @@ class RobotArmEnv(MujocoRobotEnv):
         obj_xy_range: float = 0.25,
         obj_x_offset: float = 0.6,
         obj_y_offset: float = 0.3,
+        use_polar_object_sampling: bool = True,
+        obj_radius_range: tuple[float, float] = (0.28, 0.52),
+        obj_angle_range: tuple[float, float] = (-np.pi / 2, np.pi / 2),
+        obj_table_bounds_low: Optional[np.ndarray] = None,
+        obj_table_bounds_high: Optional[np.ndarray] = None,
         max_episode_steps: int = 200,
         # Action control parameters
         action_scale: Optional[np.ndarray] = None,  # scaling for 3 joints
@@ -202,6 +218,18 @@ class RobotArmEnv(MujocoRobotEnv):
             ],
             dtype=np.float64,
         )
+
+        # Object sampling configuration for encouraging joint1 motion
+        self.use_polar_object_sampling = bool(use_polar_object_sampling)
+        self.obj_radius_range = np.array(obj_radius_range, dtype=np.float64)
+        self.obj_angle_range = np.array(obj_angle_range, dtype=np.float64)
+        self.base_xy = np.array([0.245, 0.0], dtype=np.float64)
+        if obj_table_bounds_low is None:
+            obj_table_bounds_low = np.array([0.2, -0.25], dtype=np.float64)
+        if obj_table_bounds_high is None:
+            obj_table_bounds_high = np.array([0.75, 0.6], dtype=np.float64)
+        self.obj_bounds_low = np.array(obj_table_bounds_low, dtype=np.float64)
+        self.obj_bounds_high = np.array(obj_table_bounds_high, dtype=np.float64)
 
         # ---- Trajectory / Teacher ----
         self.use_trajectory_teacher = bool(use_trajectory_teacher)
@@ -444,10 +472,10 @@ class RobotArmEnv(MujocoRobotEnv):
             reward_components["carry_bonus"] = 0.0
         if (
             not self.is_gripping
-            and d < self.distance_threshold * 1.2
+            and d < self.distance_threshold * 1.5
             and achieved_goal[2] < 0.045
         ):
-            reward_components["release_bonus"] = 2.0
+            reward_components["release_bonus"] = 5.0
         else:
             reward_components["release_bonus"] = 0.0
 
@@ -523,13 +551,16 @@ class RobotArmEnv(MujocoRobotEnv):
     def try_activate_suction(self) -> bool:
         ee_pos = self.get_ee_position()
         obj_pos = self._utils.get_site_xpos(self.model, self.data, "obj_site")
-        distance = np.linalg.norm(ee_pos - obj_pos)
+        d_vec = ee_pos - obj_pos
+        planar = np.linalg.norm(d_vec[:2])
+        vertical = abs(d_vec[2])
 
-        # 增加更严格的接触条件
-        if distance < self.suction_distance_threshold:
-            # 检查物体速度是否较低（更稳定的抓取）
+        planar_threshold = 0.015
+        vertical_threshold = min(self.suction_distance_threshold, 0.03)
+
+        if planar < planar_threshold and vertical < vertical_threshold:
             obj_vel = self._utils.get_site_xvelp(self.model, self.data, "obj_site")
-            if np.linalg.norm(obj_vel) < 0.5:  # 速度阈值
+            if np.linalg.norm(obj_vel) < 0.5:
                 self.data.eq_active[self.suction_weld_id] = 1
                 return True
         return False
@@ -620,10 +651,10 @@ class RobotArmEnv(MujocoRobotEnv):
     def _is_success(self, achieved_goal, desired_goal) -> np.float32:
         d = self.goal_distance(achieved_goal, desired_goal)
         # 只有在物体在目标位置且已经释放吸盘的情况下才算成功
-        # 或者物体在目标位置且高度较低（已放下）
         object_at_goal = d < self.distance_threshold
         object_on_ground = achieved_goal[2] < 0.04  # 物体接近地面
-        return (object_at_goal and object_on_ground).astype(np.float32)
+        released = not self.is_gripping
+        return np.float32(object_at_goal and object_on_ground and released)
 
     def _render_callback(self) -> None:
         pass
@@ -682,11 +713,45 @@ class RobotArmEnv(MujocoRobotEnv):
         return np.linalg.norm(goal_a - goal_b, axis=-1)
 
     def _sample_object(self) -> None:
-        # same-side sampling for left-arm setup (no explicit left/right flag)
-        # 扩大采样范围，鼓励使用 joint1
-        custom_range_low = np.array([0.25, 0.15, 0.025])
-        custom_range_high = np.array([0.6, 0.6, 0.025])
-        object_position = self.np_random.uniform(custom_range_low, custom_range_high)
+        # Encourage wide joint1 usage by sampling around the base in polar coordinates
+        min_dist = 0.12
+        object_position = None
+
+        if self.use_polar_object_sampling:
+            for _ in range(96):
+                radius = self.np_random.uniform(
+                    float(self.obj_radius_range[0]), float(self.obj_radius_range[1])
+                )
+                angle = self.np_random.uniform(
+                    float(self.obj_angle_range[0]), float(self.obj_angle_range[1])
+                )
+                offset = np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+                candidate_xy = self.base_xy + radius * offset
+
+                if not np.all(candidate_xy >= self.obj_bounds_low) or not np.all(
+                    candidate_xy <= self.obj_bounds_high
+                ):
+                    continue
+
+                candidate = np.array(
+                    [candidate_xy[0], candidate_xy[1], self.obj_range_low[2]],
+                    dtype=np.float64,
+                )
+                if np.linalg.norm(candidate - self.goal) >= min_dist:
+                    object_position = candidate
+                    break
+
+        if object_position is None:
+            custom_range_low = np.array([0.25, 0.1, self.obj_range_low[2]])
+            custom_range_high = np.array([0.6, 0.6, self.obj_range_high[2]])
+            for _ in range(64):
+                candidate = self.np_random.uniform(custom_range_low, custom_range_high)
+                if np.linalg.norm(candidate - self.goal) >= min_dist:
+                    object_position = candidate
+                    break
+            if object_position is None:
+                object_position = candidate
+
         object_xpos = np.concatenate([object_position, np.array([1, 0, 0, 0])])
         self._utils.set_joint_qpos(self.model, self.data, "obj_joint", object_xpos)
 
@@ -720,9 +785,13 @@ class RobotArmEnv(MujocoRobotEnv):
             jacr = np.zeros((3, self.model.nv), dtype=np.float64)
             mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.ee_site_id)
 
-            # take columns corresponding to our joints' dofs (assume contiguous first 3 nv map to joint1,2,3_slide)
-            # If your model maps differently, adjust indices accordingly.
-            J = jacp[:, :3]  # shape (3,3)
+            # Map jacobian columns to the configured joints to avoid hard-coded dof order assumptions.
+            joint_ids = [
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                for name in self.joint_names
+            ]
+            dof_cols = [self.model.jnt_dofadr[jid] for jid in joint_ids]
+            J = jacp[:, dof_cols]
 
             # damped least squares: dq = J^T (J J^T + λ^2 I)^-1 dx
             JJt = J @ J.T

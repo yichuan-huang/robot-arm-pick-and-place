@@ -31,8 +31,8 @@ model = SAC(
     "MultiInputPolicy", env, verbose=1, tensorboard_log="./logs/SAC_pick_and_place/"
 )
 start_time = time.time()
-progress_callback = ProgressBarCallback(total_timesteps=1000000)
-model.learn(total_timesteps=1000000, callback=progress_callback)
+progress_callback = ProgressBarCallback(total_timesteps=5000000)
+model.learn(total_timesteps=5000000, callback=progress_callback)
 model.save("model/SAC_pick_and_place.zip")
 end_time = time.time()
 with open("./logs/SAC_pick_and_place/SAC_pick_and_place_train_time.txt", "w") as opener:
