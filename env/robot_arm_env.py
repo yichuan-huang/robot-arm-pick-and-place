@@ -76,16 +76,16 @@ class _TrajectoryPlanner:
                 # Wait at pick position until suction is successful
                 return
 
-            # ---- 淇敼閮ㄥ垎锛氬厑璁稿湪 phase=4 绛夊緟鏈夐檺姝ュ悗缁х画 ----
+            # ---- Modified: allow waiting for several steps at phase=4 before proceeding ----
             if self.phase == 4:
                 if not hasattr(self, "release_wait_counter"):
                     self.release_wait_counter = 0
                 if is_gripping:
                     self.release_wait_counter += 1
-                    # 绛夊緟鍑犳缁� agent 鏉炬墜鏈轰細锛堢害0.1绉掑乏鍙筹級
+                    # Wait for several steps to give the agent time to release the object
                     if self.release_wait_counter < 10:
                         return
-                # 閲嶇疆璁℃暟鍣�
+                # Reset the counter
                 self.release_wait_counter = 0
 
             self.phase += 1
@@ -98,6 +98,16 @@ class RobotArmEnv(MujocoRobotEnv):
     A custom robot arm environment for a pick-and-place task using a suction gripper.
     Adds a task-space trajectory planner and a residual "teacher" controller
     to ease learning when the policy only outputs delta joint commands.
+
+        This version adds a joint step-size limit based on the joint-angle–time
+        relationship:
+            - Uses a polynomial fitted in Excel t(θ) ≈ -7e-05 θ^2 + 0.0242 θ + 0.3771
+                (θ is the angle in degrees)
+            - Larger angles lead to smaller allowed per-step joint increments, which
+                better matches a real robot arm's motion characteristics
+            - This limit is applied to both:
+                    (1) RL output joint increments (_set_action)
+                    (2) Residual IK teacher-computed delta_q (_ik_step_to_target)
     """
 
     metadata = {
@@ -148,6 +158,9 @@ class RobotArmEnv(MujocoRobotEnv):
         assist_init: float = 1.0,
         assist_decay: float = 3.0,
         track_reward_scale: float = 1.5,  # shaping reward weight for tracking target EE
+        # ---- Joint step-size limit: based on angle-time relationship ----
+        base_joint_step_rot: float = 0.05,  # maximum single-step increment (rad) for rotating joints at the "fastest" position
+        slide_joint_step: float = 0.01,  # maximum single-step increment (m) for the prismatic joint
         **kwargs,
     ):
         self.model_path = model_path
@@ -165,6 +178,10 @@ class RobotArmEnv(MujocoRobotEnv):
             self.action_scale = np.array([0.15, 0.12, 0.025], dtype=np.float64)
         else:
             self.action_scale = np.array(action_scale, dtype=np.float64)
+
+        # Joint step-size limit parameters (scaled by angle-time curve)
+        self.base_joint_step_rot = float(base_joint_step_rot)
+        self.slide_joint_step = float(slide_joint_step)
 
         # Episode tracking
         self.max_episode_steps = max_episode_steps
@@ -197,7 +214,7 @@ class RobotArmEnv(MujocoRobotEnv):
 
         self.distance_threshold = distance_threshold
 
-        # Object sampling range (Keep same-side sampling, do not distinguish between left and right arms)
+        # Object sampling range
         self.obj_xy_range = obj_xy_range
         self.obj_x_offset = obj_x_offset
         self.obj_y_offset = obj_y_offset
@@ -230,7 +247,7 @@ class RobotArmEnv(MujocoRobotEnv):
         self.obj_bounds_low = np.array(obj_table_bounds_low, dtype=np.float64)
         self.obj_bounds_high = np.array(obj_table_bounds_high, dtype=np.float64)
 
-        # ---- Trajectory / Teacher ----
+        # Trajectory / Teacher
         self.use_trajectory_teacher = bool(use_trajectory_teacher)
         self.traj_hover_z = float(traj_hover_z)
         self.traj_pick_z = float(traj_pick_z)
@@ -514,6 +531,8 @@ class RobotArmEnv(MujocoRobotEnv):
 
         # 1. Control arm joints
         arm_action = action[:3]
+
+        # Current joint positions
         current_joints_list = []
         for name in self.joint_names:
             qpos = self._utils.get_joint_qpos(self.model, self.data, name)
@@ -522,8 +541,15 @@ class RobotArmEnv(MujocoRobotEnv):
             )
         current_joints = np.array(current_joints_list, dtype=np.float64)
 
-        # target joints = current + delta (scaled)
-        target_joints = current_joints + arm_action * self.action_scale
+        # Compute raw target increments
+        raw_delta_joints = arm_action * self.action_scale
+
+        # ---- New: joint step-size limit based on angle-time polynomial ----
+        step_limits = self._joint_step_limits(current_joints)
+        clipped_delta_joints = np.clip(raw_delta_joints, -step_limits, step_limits)
+
+        # target joints = current + delta (scaled & clipped)
+        target_joints = current_joints + clipped_delta_joints
         target_joints = np.clip(
             target_joints, self.ctrl_range[:, 0], self.ctrl_range[:, 1]
         )
@@ -540,7 +566,7 @@ class RobotArmEnv(MujocoRobotEnv):
                     self.is_gripping = True
                     self.grip_stabilization_steps = 0
             else:
-                # 淇濇寔鍚搁檮鐘舵€�
+                # Keep suction active
                 self.data.eq_active[self.suction_weld_id] = 1
                 self.grip_stabilization_steps += 1
         else:  # Deactivate
@@ -773,6 +799,11 @@ class RobotArmEnv(MujocoRobotEnv):
         """
         One damped least-squares IK step to move EE towards target_ee.
         Returns delta_q (in joint units) for [joint1, joint2, joint3_slide].
+
+        In this version, after obtaining dq, we additionally apply an
+        angle-time based step-size limit according to the current joint
+        angles, so that the teacher's motion better matches the velocity
+        profile of a real robot arm.
         """
         try:
             # pose error (position only)
@@ -800,9 +831,73 @@ class RobotArmEnv(MujocoRobotEnv):
             inv = np.linalg.inv(JJt + lam2I)
             dq = J.T @ (inv @ dx)
 
-            # clip to joint control range per step
-            # (not strictly necessary here; _set_action will clip final qpos)
+            # Get current joint positions for step-size limiting
+            current_joints_list = []
+            for name in self.joint_names:
+                qpos = self._utils.get_joint_qpos(self.model, self.data, name)
+                current_joints_list.append(
+                    float(qpos.flat[0]) if isinstance(qpos, np.ndarray) else float(qpos)
+                )
+            current_joints = np.array(current_joints_list, dtype=np.float64)
+
+            # ---- New: apply angle-time based step-size limit to dq ----
+            step_limits = self._joint_step_limits(current_joints)
+            dq = np.clip(dq, -step_limits, step_limits)
+
             return np.asarray(dq, dtype=np.float64)
         except Exception:
             # fall back: no teacher step
             return None
+
+    # ---------- Angle-time based joint step limiting ----------
+
+    def _angle_time_poly_deg(self, theta_deg: np.ndarray) -> np.ndarray:
+        """
+        Use the polynomial fitted from Excel:
+            t(θ) = -7e-05 * θ^2 + 0.0242 * θ + 0.3771
+        where θ is in degrees and t can be interpreted as a time scale
+        required to complete the motion of that angle.
+
+        For safety, we clamp t to a lower bound to avoid 0 or negative values.
+        """
+        a = -7e-05
+        b = 0.0242
+        c = 0.3771
+        t = a * theta_deg**2 + b * theta_deg + c
+        # Prevent 0 or negative values
+        t = np.maximum(t, 0.1)
+        return t
+
+    def _joint_step_limits(self, qpos: np.ndarray) -> np.ndarray:
+        """
+        Compute the maximum allowed Δq for each joint within one simulation step
+        based on the current joint angles.
+
+        - For the first two rotational joints:
+            Use the angle-time polynomial to obtain t(θ), then use 1 / t(θ) as a
+            "speed scale" and combine it with base_joint_step_rot so that
+            larger angles imply smaller step limits.
+        - For the third prismatic joint:
+            Use a fixed upper bound self.slide_joint_step.
+        """
+        qpos = np.asarray(qpos, dtype=np.float64)
+        # The first two are rotational joints (in radians)
+        theta_deg = np.abs(np.rad2deg(qpos[:2]))
+        t = self._angle_time_poly_deg(theta_deg)  # Larger time → slower motion
+
+        # Define a reference time t0 at θ≈1 deg for normalization
+        t0 = self._angle_time_poly_deg(np.zeros_like(theta_deg) + 1.0)[0]  # 近似 1 deg
+
+        # Speed scale ~ t0 / t, larger angle → larger t → smaller speed
+        speed_scale = t0 / t  # roughly in (0.1, 1.0)
+
+        # Max step = base step * speed scale
+        rot_limits = self.base_joint_step_rot * speed_scale
+
+        # Fixed step limit for the prismatic joint
+        slide_limit = np.array([self.slide_joint_step], dtype=np.float64)
+
+        limits = np.concatenate([rot_limits, slide_limit], axis=0)
+        # Avoid numerical issues
+        limits = np.clip(limits, 1e-4, None)
+        return limits

@@ -10,3 +10,4 @@ assets/*.urdf
 assets/*.xacro
 videos/
 *.gif
+*.xlsx
