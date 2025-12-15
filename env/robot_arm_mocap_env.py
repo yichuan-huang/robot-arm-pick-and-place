@@ -40,7 +40,7 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         obj_xy_range: float = 0.25,
         obj_x_offset: float = 0.6,
         obj_y_offset: float = 0.3,
-        # Goal sampling parameters 
+        # Goal sampling parameters
         goal_xy_range: float = 0.3,
         goal_x_offset: float = 0.4,
         goal_z_range: float = 0.2,
@@ -430,7 +430,7 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         action: Optional[np.ndarray] = None,
         obs_dict: Optional[dict] = None,
     ) -> SupportsFloat:
-        """Compute dense reward """
+        """Compute dense reward"""
         d = float(self.goal_distance(achieved_goal, desired_goal))
 
         reward_components: dict[str, float] = {}
@@ -599,8 +599,9 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         return np.linalg.norm(goal_a - goal_b, axis=-1)
 
     def _sample_goal(self) -> np.ndarray:
-        """Sample a goal position"""
-        goal = self.np_random.uniform(self.goal_range_low, self.goal_range_high)
+        """Return fixed goal position at target zone"""
+        # Fixed goal position at target_zone (0.6032, 0.5114, 0.025)
+        goal = np.array([0.6032, 0.5114, 0.025], dtype=np.float64)
         return goal
 
     def _sample_object(self) -> None:
