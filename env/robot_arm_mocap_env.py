@@ -37,17 +37,14 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         model_path: str = None,
         n_substeps: int = 50,
         distance_threshold: float = 0.05,
+        goal_position: Optional[np.ndarray] = None,
         obj_xy_range: float = 0.25,
         obj_x_offset: float = 0.6,
         obj_y_offset: float = 0.3,
-        # Goal sampling parameters
-        goal_xy_range: float = 0.3,
-        goal_x_offset: float = 0.4,
-        goal_z_range: float = 0.2,
         max_episode_steps: int = 200,
         # Action control parameters (for end-effector position control)
         pos_ctrl_scale: float = 0.05,  # meters per action unit
-        # Reward weights
+        # Reward weights (similar to Panda env)
         w_progress: float = 2.0,
         w_distance: float = -1.0,
         w_action: float = -0.001,
@@ -67,8 +64,11 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         self.model_path = model_path
         action_size = 4  # 3 for position control + 1 for gripper
 
-        # Initialize goal (will be properly sampled in reset)
-        self.goal = np.array([0.6032, 0.5114, 0.025], dtype=np.float64)
+        # Initialize goal
+        if goal_position is None:
+            self.goal = np.array([0.6032, 0.5114, 0.025], dtype=np.float64)
+        else:
+            self.goal = np.array(goal_position, dtype=np.float64)
 
         # Position control scaling
         self.pos_ctrl_scale = float(pos_ctrl_scale)
@@ -127,28 +127,6 @@ class RobotArmMocapEnv(MujocoRobotEnv):
             ],
             dtype=np.float64,
         )
-
-        # Goal sampling range
-        self.goal_xy_range = goal_xy_range
-        self.goal_x_offset = goal_x_offset
-        self.goal_z_range = goal_z_range
-
-        self.goal_range_low = np.array(
-            [-self.goal_xy_range / 2 + goal_x_offset, -self.goal_xy_range / 2, 0]
-        )
-        self.goal_range_high = np.array(
-            [
-                self.goal_xy_range / 2 + goal_x_offset,
-                self.goal_xy_range / 2,
-                self.goal_z_range,
-            ]
-        )
-
-        # Adjust goal range based on object offset
-        self.goal_range_low[0] += self.obj_x_offset
-        self.goal_range_high[0] += self.obj_x_offset
-        self.goal_range_low[1] += self.obj_y_offset
-        self.goal_range_high[1] += self.obj_y_offset
 
         # Neutral/initial joint positions
         self.neutral_joint_values = np.array([0.0, 0.0, 0.0], dtype=np.float64)
@@ -430,7 +408,7 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         action: Optional[np.ndarray] = None,
         obs_dict: Optional[dict] = None,
     ) -> SupportsFloat:
-        """Compute dense reward"""
+        """Compute dense reward (similar to Panda env)"""
         d = float(self.goal_distance(achieved_goal, desired_goal))
 
         reward_components: dict[str, float] = {}
@@ -599,9 +577,15 @@ class RobotArmMocapEnv(MujocoRobotEnv):
         return np.linalg.norm(goal_a - goal_b, axis=-1)
 
     def _sample_goal(self) -> np.ndarray:
-        """Return fixed goal position at target zone"""
-        # Fixed goal position at target_zone (0.6032, 0.5114, 0.025)
-        goal = np.array([0.6032, 0.5114, 0.025], dtype=np.float64)
+        """Sample a goal position"""
+        goal = np.array([0.0, 0.0, self.initial_object_height])
+        noise = self.np_random.uniform(self.obj_range_low, self.obj_range_high)
+
+        # Sometimes place goal at table height, sometimes elevated
+        if self.np_random.random() < 0.3:
+            noise[2] = 0.0
+
+        goal += noise
         return goal
 
     def _sample_object(self) -> None:
