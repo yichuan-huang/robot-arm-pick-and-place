@@ -34,10 +34,10 @@ model = SAC(
 )
 
 start_time = time.time()
-progress_callback = ProgressBarCallback(total_timesteps=2000000)
+progress_callback = ProgressBarCallback(total_timesteps=5000000)
 
 print("Starting training with mocap control...")
-model.learn(total_timesteps=2000000, callback=progress_callback)
+model.learn(total_timesteps=5000000, callback=progress_callback)
 model.save("model/SAC_pick_and_place_mocap.zip")
 
 end_time = time.time()

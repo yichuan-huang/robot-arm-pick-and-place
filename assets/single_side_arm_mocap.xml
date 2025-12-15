@@ -109,7 +109,8 @@
 
         <!-- Mocap body for end-effector control -->
         <body name="arm_mocap" mocap="true" pos="0.6032 0.5114 0.18">
-            <geom name="mocap_geom" type="box" size="0.01 0.01 0.01" rgba="0 1 0 0.3" contype="0"
+            <!-- Mocap visualization geom - set to invisible or very small -->
+            <geom name="mocap_geom" type="box" size="0.001 0.001 0.001" rgba="0 1 0 0" contype="0"
                 conaffinity="0" />
         </body>
 
