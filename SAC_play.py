@@ -9,7 +9,7 @@ import env # Ensure custom envs are registered
 # ---- Config ----
 env_id = "RobotArmPickAndPlace-v0"
 model_path = "model/SAC_pick_and_place.zip"
-episodes = 50
+episodes = 10
 video_fps = 30
 # Output
 video_folder = "videos"
